@@ -6,5 +6,6 @@
   },
   "listen": "192.168.1.1",
   "port": 8099,
-  "poll_seconds": 30
+  "poll_seconds": 30,
+  "api_tokens": []
 }

@@ -2,3 +2,4 @@ config.json
 archive.sqlite*
 backup-*/
 __pycache__/
+.local/

@@ -1,0 +1,53 @@
+version: "1"
+app: sms-gateway
+
+target:
+  host: 192.168.1.1
+  user: root
+  port: 222
+  key: ~/.ssh/keenetic_ed25519
+  remote_bin: /opt/bin/dms-service
+  root: /opt/dms
+
+# Runtime state lives next to the code on the router (config.json with RouterOS
+# credentials, the SMS archive); it is never shipped and never overwritten.
+ignore:
+  - .local
+  - tests
+  - __pycache__
+  - config.json
+  - archive.sqlite*
+  - backup-*
+
+artifacts:
+  - source: server.py
+    destination: /opt/sms-gateway/server.py
+    mode: 0644
+  - source: store.py
+    destination: /opt/sms-gateway/store.py
+    mode: 0644
+  - source: gateway.py
+    destination: /opt/sms-gateway/gateway.py
+    mode: 0644
+  - source: pdu.py
+    destination: /opt/sms-gateway/pdu.py
+    mode: 0644
+  - source: routeros.py
+    destination: /opt/sms-gateway/routeros.py
+    mode: 0644
+  - source: static
+    destination: /opt/sms-gateway/static
+    mode: 0755
+  - source: S99sms-gateway
+    destination: /opt/sms-gateway/S99sms-gateway
+    mode: 0755
+
+service:
+  init_source: /opt/sms-gateway/S99sms-gateway
+  init_name: S99sms-gateway
+  action: restart
+
+healthcheck:
+  url: http://192.168.1.1:8099/api/health
+  attempts: 20
+  interval: 1s
