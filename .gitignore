@@ -1,0 +1,4 @@
+config.json
+archive.sqlite*
+backup-*/
+__pycache__/

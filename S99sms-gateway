@@ -1,0 +1,30 @@
+#!/opt/bin/sh
+PATH=/opt/bin:/opt/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+PIDFILE=/opt/var/run/sms-gateway.pid
+APP=/opt/sms-gateway/server.py
+running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && tr '\0' ' ' < "/proc/$(cat "$PIDFILE")/cmdline" | grep -q "$APP"; }
+start() {
+ if running; then echo 'SMS Gateway already running'; return; fi
+ mkdir -p /opt/var/run /opt/var/log
+ umask 077
+ nohup /opt/bin/python3 "$APP" >>/opt/var/log/sms-gateway.log 2>&1 &
+ echo $! > "$PIDFILE"
+ sleep 1
+ running
+}
+stop() {
+ if running; then
+  kill "$(cat "$PIDFILE")"
+  count=0
+  while running && [ "$count" -lt 10 ]; do sleep 1; count=$((count+1)); done
+  if running; then echo 'Process still stopping'; return 1; fi
+ fi
+ rm -f "$PIDFILE"
+}
+case "$1" in
+ start) start;;
+ stop) stop;;
+ restart) stop && start;;
+ status) if running; then echo 'SMS Gateway running'; else echo 'SMS Gateway stopped'; exit 1; fi;;
+ *) echo "Usage: $0 {start|stop|restart|status}";exit 1;;
+esac
