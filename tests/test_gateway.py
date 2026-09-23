@@ -90,6 +90,17 @@ class StoreTest(unittest.TestCase):
         self.store.mark_read([m['id']], read=False)
         self.assertFalse(self.store.messages()[0]['read'])
 
+    def test_delete_removes_all_parts_and_forward_record(self):
+        add(self.store, 1, text='A', concat=[5, 2, 1])
+        add(self.store, 2, text='B', concat=[5, 2, 2])
+        add(self.store, 3, text='keep')
+        concat = next(m for m in self.store.messages() if m.get('parts'))
+        self.store.record_forward(concat['id'], None, 'done')
+        self.assertEqual(self.store.delete_messages([max(concat['ids'])]), 1)
+        self.assertEqual([m['text'] for m in self.store.messages()], ['keep'])
+        with self.store.tx() as c:
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM forwards').fetchone()[0], 0)
+
     def test_missing_part_is_marked_incomplete(self):
         add(self.store, 1, text='A', concat=[9, 3, 1])
         [m] = self.store.messages()
@@ -220,7 +231,7 @@ class LimitTest(unittest.TestCase):
         self.assertEqual(old.sent_count(0), 3)
 
 
-class HttpTest(unittest.TestCase):
+class HttpBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = make_store(self.tmp.name)
@@ -251,6 +262,7 @@ class HttpTest(unittest.TestCase):
     def auth(self, token='secret-token'):
         return {'Authorization': 'Bearer ' + token}
 
+class HttpTest(HttpBase):
     def test_api_requires_valid_token(self):
         self.assertEqual(self.call('GET', '/api/v1/messages')[0], 401)
         self.assertEqual(self.call('GET', '/api/v1/messages', headers=self.auth('wrong'))[0], 401)
@@ -288,6 +300,34 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(code, 429)
         self.assertIn('лимит', body['error'].lower())
         self.assertEqual(self.call('GET', '/api/v1/limits', headers=self.auth())[1]['remaining'], 0)
+
+    def wait_op(self, oid):
+        for _ in range(100):
+            op = self.store.operation(oid)
+            if op['status'] != 'pending':
+                return op
+            time.sleep(0.05)
+        return op
+
+    def test_batch_forward_and_delete(self):
+        csrf = {'X-CSRF-Token': self.call('GET', '/api/state')[1]['csrf']}
+        add(self.store, 2, sender='900', text='Второе', stamp='2026-09-23T10:05:00+03:00')
+        ids = [m['id'] for m in self.store.messages()]
+        self.assertEqual(self.call('POST', '/api/forward-batch', {'message_ids': ids}, csrf)[0], 400)
+        self.call('POST', '/api/forwarding', {'enabled': False, 'number': '+79990000000', 'max_parts': 3}, csrf)
+        self.assertEqual(self.call('POST', '/api/forward-batch', {'message_ids': list(range(1, 30))}, csrf)[0], 400)
+        code, body = self.call('POST', '/api/forward-batch', {'message_ids': ids}, csrf)
+        self.assertEqual(code, 202)
+        op = self.wait_op(body['id'])
+        self.assertEqual(op['status'], 'done')
+        self.assertEqual([n for n, _ in self.router.sent], ['+79990000000', '+79990000000'])
+        self.assertIn('Privet', self.router.sent[0][1])
+        self.assertEqual({m['forward']['status'] for m in self.store.messages()}, {'done'})
+
+        self.assertEqual(self.call('POST', '/api/delete', {'ids': ids}, csrf)[0], 400)
+        code, body = self.call('POST', '/api/delete', {'ids': ids, 'confirm': True}, csrf)
+        self.assertEqual((code, body['deleted']), (200, 2))
+        self.assertEqual(self.store.messages(), [])
 
     def test_ui_post_requires_csrf(self):
         self.assertEqual(self.call('POST', '/api/read', {'ids': [1]})[0], 403)

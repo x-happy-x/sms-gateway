@@ -15,7 +15,16 @@ const ui = {
   selected: null,
   highlight: null,
   keepUnread: new Set(),
+  selecting: false,
+  sel: new Set(),
+  anchor: null,
+  order: [],
+  selectable: new Set(),
+  suppressClick: 0,
+  contactQ: '',
+  editContact: null,
 };
+let current = { items: [], threads: [] };
 let data = null;
 let csrf = '';
 let busy = false;
@@ -132,6 +141,19 @@ const operationId = () => (crypto.randomUUID ? crypto.randomUUID()
 
 // --- data model --------------------------------------------------------------
 
+const digits10 = (addr) => String(addr || '').replace(/\D/g, '').slice(-10);
+let contactIndex = new Map();
+
+function indexContacts() {
+  contactIndex = new Map((data.contacts || []).map((c) => [digits10(c.number), c]));
+}
+
+function contactFor(addr) {
+  return isPhone(addr) ? contactIndex.get(digits10(addr)) || null : null;
+}
+
+const displayName = (addr) => contactFor(addr)?.name || addr || '—';
+
 function items() {
   const out = [];
   for (const m of data.messages) {
@@ -142,10 +164,12 @@ function items() {
   }
   for (const op of data.sent) {
     const req = op.request || {};
+    const text = op.kind === 'send' ? req.text
+      : op.kind === 'forward-batch' ? (req.items || []).map((i) => i.parts.join('\n')).join('\n\n')
+        : (req.parts || []).join('\n');
     out.push({
       dir: 'out', id: op.id, addr: req.number, kind: op.kind, status: op.status, result: op.result?.text,
-      text: op.kind === 'send' ? req.text : (req.parts || []).join('\n'), from: req.sender, via: req.via,
-      time: op.added * 1000, read: true,
+      text, from: req.sender, count: req.count, via: req.via, time: op.added * 1000, read: true,
     });
   }
   return out;
@@ -155,15 +179,19 @@ function threads(all) {
   const map = new Map();
   for (const it of all) {
     const key = threadKey(it.addr);
-    const t = map.get(key) || { key, name: it.addr, items: [], unread: 0, last: null };
+    const t = map.get(key) || { key, addr: it.addr, items: [], unread: 0, last: null };
     t.items.push(it);
     if (it.dir === 'in' && !it.read) t.unread += 1;
     if (!t.last || it.time > t.last.time) t.last = it;
     // Prefer the sender spelling of incoming messages, it is what the operator shows.
-    if (it.dir === 'in' && (!t.nameFromIn || it.time > t.nameTime)) Object.assign(t, { name: it.addr, nameFromIn: true, nameTime: it.time });
+    if (it.dir === 'in' && (!t.fromIn || it.time > t.addrTime)) Object.assign(t, { addr: it.addr, fromIn: true, addrTime: it.time });
     map.set(key, t);
   }
-  for (const t of map.values()) t.items.sort((a, b) => a.time - b.time);
+  for (const t of map.values()) {
+    t.items.sort((a, b) => a.time - b.time);
+    t.contact = contactFor(t.addr);
+    t.name = t.contact?.name || t.addr;
+  }
   return [...map.values()];
 }
 
@@ -172,25 +200,110 @@ function matches(text) {
   return !q || String(text || '').toLowerCase().includes(q);
 }
 
+// --- selection -------------------------------------------------------------------
+
+function enterSelect() {
+  ui.selecting = true;
+  ui.sel.clear();
+  ui.anchor = null;
+}
+
+function exitSelect() {
+  ui.selecting = false;
+  ui.sel.clear();
+  ui.anchor = null;
+  render(true);
+}
+
+function selectRange(from, to) {
+  const [a, b] = from < to ? [from, to] : [to, from];
+  for (let i = a; i <= b; i += 1) if (ui.selectable.has(ui.order[i])) ui.sel.add(ui.order[i]);
+}
+
+function selectableRow({ key, selectable, open, cls }, leading, ...rest) {
+  const index = ui.order.push(key) - 1;
+  if (selectable) ui.selectable.add(key);
+  const selected = ui.sel.has(key);
+  const state = !ui.selecting ? '' : !selectable ? ' not-selectable' : selected ? ' selected' : '';
+  const el = h('button', {
+    class: 'item' + cls + state, type: 'button', role: ui.selecting ? 'checkbox' : 'listitem',
+    'aria-checked': ui.selecting ? String(selected) : null,
+  }, ui.selecting ? h('span', { class: 'check', 'aria-hidden': 'true' }, icon('check')) : leading, ...rest);
+
+  el.addEventListener('click', (e) => {
+    if (Date.now() < ui.suppressClick) return;
+    if (!ui.selecting && !(e.ctrlKey || e.metaKey)) { open(); return; }
+    if (!selectable) return;
+    if (!ui.selecting) enterSelect();
+    if (e.shiftKey && ui.anchor != null) selectRange(ui.anchor, index);
+    else if (ui.sel.has(key)) ui.sel.delete(key);
+    else ui.sel.add(key);
+    ui.anchor = index;
+    render(true);
+  });
+
+  let timer = null;
+  let start = null;
+  el.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch' || !selectable) return;
+    start = [e.clientX, e.clientY];
+    timer = setTimeout(() => {
+      timer = null;
+      ui.suppressClick = Date.now() + 600;
+      if (!ui.selecting) enterSelect();
+      ui.sel.add(key);
+      ui.anchor = index;
+      navigator.vibrate?.(12);
+      render(true);
+    }, 450);
+  });
+  const cancel = (e) => {
+    if (!timer) return;
+    if (e.type === 'pointermove' && Math.hypot(e.clientX - start[0], e.clientY - start[1]) < 8) return;
+    clearTimeout(timer);
+    timer = null;
+  };
+  for (const type of ['pointerup', 'pointercancel', 'pointerleave', 'pointermove']) el.addEventListener(type, cancel);
+  return el;
+}
+
+function selectedMessages() {
+  const out = new Map();
+  for (const key of ui.sel) {
+    if (key.startsWith('t:')) {
+      const t = current.threads.find((x) => 't:' + x.key === key);
+      for (const i of t ? t.items : []) if (i.dir === 'in') out.set(i.id, i);
+    } else {
+      const it = current.items.find((i) => i.dir === 'in' && 'm:' + i.id === key);
+      if (it) out.set(it.id, it);
+    }
+  }
+  return [...out.values()];
+}
+
 // --- rendering: list -----------------------------------------------------------
 
 function renderList(all, allThreads) {
   const list = $('list');
   const scroll = list.scrollTop;
   list.replaceChildren();
+  list.classList.toggle('selecting', ui.selecting);
+  ui.order = [];
+  ui.selectable = new Set();
   let count = 0;
 
   if (ui.group === 'threads') {
-    let ts = allThreads.filter((t) => (ui.filter !== 'unread' || t.unread > 0)
-      && (matches(t.name) || t.items.some((i) => matches(i.text))));
+    const ts = allThreads.filter((t) => (ui.filter !== 'unread' || t.unread > 0)
+      && (matches(t.name) || matches(t.addr) || t.items.some((i) => matches(i.text))));
     ts.sort(ui.sort === 'name' ? (a, b) => String(a.name).localeCompare(String(b.name), 'ru')
       : ui.sort === 'old' ? (a, b) => a.last.time - b.last.time : (a, b) => b.last.time - a.last.time);
     for (const t of ts) list.append(threadRow(t));
     count = ts.length;
     $('list-count').textContent = count ? `Диалогов: ${count}` : '';
   } else {
-    let msgs = all.filter((i) => (ui.filter !== 'unread' || (i.dir === 'in' && !i.read)) && (matches(i.text) || matches(i.addr)));
-    msgs.sort(ui.sort === 'name' ? (a, b) => String(a.addr).localeCompare(String(b.addr), 'ru') || b.time - a.time
+    const msgs = all.filter((i) => (ui.filter !== 'unread' || (i.dir === 'in' && !i.read))
+      && (matches(i.text) || matches(i.addr) || matches(displayName(i.addr))));
+    msgs.sort(ui.sort === 'name' ? (a, b) => String(displayName(a.addr)).localeCompare(String(displayName(b.addr)), 'ru') || b.time - a.time
       : ui.sort === 'old' ? (a, b) => a.time - b.time : (a, b) => b.time - a.time);
     let lastDay = null;
     for (const m of msgs) {
@@ -206,7 +319,28 @@ function renderList(all, allThreads) {
   if (!count) {
     list.append(h('div', { class: 'empty', text: ui.q ? 'Ничего не найдено' : ui.filter === 'unread' ? 'Непрочитанных нет' : 'Сообщений пока нет' }));
   }
+  // Hidden rows (search, filter) drop out of the selection so actions only touch what is visible.
+  for (const key of [...ui.sel]) if (!ui.selectable.has(key)) ui.sel.delete(key);
   list.scrollTop = scroll;
+  renderBulk();
+}
+
+function renderBulk() {
+  $('bulk-bar').hidden = !ui.selecting;
+  $('select-toggle').textContent = ui.selecting ? 'Готово' : 'Выбрать';
+  $('read-all').hidden = ui.selecting || !data.messages.some((m) => !m.read);
+  if (!ui.selecting) return;
+  const msgs = selectedMessages();
+  const n = msgs.length;
+  $('bulk-count').textContent = !ui.sel.size ? 'Ничего не выбрано'
+    : ui.group === 'threads' ? `Отправителей: ${ui.sel.size} · сообщений: ${n}` : `Выбрано: ${n}`;
+  const all = ui.selectable.size > 0 && [...ui.selectable].every((k) => ui.sel.has(k));
+  $('bulk-all').textContent = all ? 'Снять все' : 'Выбрать все';
+  $('bulk-read').disabled = !msgs.some((m) => !m.read);
+  $('bulk-unread').disabled = !msgs.some((m) => m.read);
+  $('bulk-forward').disabled = !n || busyNow();
+  $('bulk-forward').title = data.forwarding.number ? `Переслать на ${displayName(data.forwarding.number)}` : 'Номер пересылки не задан';
+  $('bulk-delete').disabled = !n;
 }
 
 function snippet(it) {
@@ -215,14 +349,15 @@ function snippet(it) {
 }
 
 function threadRow(t) {
-  const active = ui.selected === t.key;
-  return h('button', {
-    class: 'item' + (t.unread ? ' unread' : '') + (active ? ' active' : ''), type: 'button', role: 'listitem',
-    'aria-current': active ? 'true' : null, onclick: () => openThread(t.key),
+  const active = ui.selected === t.key && !ui.selecting;
+  return selectableRow({
+    key: 't:' + t.key, selectable: t.items.some((i) => i.dir === 'in'), open: () => openThread(t.key),
+    cls: (t.unread ? ' unread' : '') + (active ? ' active' : ''),
   },
   avatar(t.name, t.key),
   h('div', { class: 'item-main' },
-    h('div', { class: 'item-top' }, h('span', { class: 'item-name', text: t.name })),
+    h('div', { class: 'item-top' }, h('span', { class: 'item-name', text: t.name }),
+      t.contact ? h('span', { class: 'item-sub', text: t.addr }) : null),
     h('div', { class: 'item-snippet', text: snippet(t.last) })),
   h('div', { class: 'item-side' },
     h('span', { class: 'item-time', text: shortTime(t.last.time), title: fullTime(t.last.time) }),
@@ -232,13 +367,13 @@ function threadRow(t) {
 function messageRow(m) {
   const key = threadKey(m.addr);
   const unread = m.dir === 'in' && !m.read;
-  return h('button', {
-    class: 'item' + (unread ? ' unread' : ''), type: 'button', role: 'listitem',
-    onclick: () => openThread(key, m.id),
+  const name = displayName(m.addr);
+  return selectableRow({
+    key: 'm:' + m.id, selectable: m.dir === 'in', open: () => openThread(key, m.id), cls: unread ? ' unread' : '',
   },
-  avatar(m.addr, key),
+  avatar(name, key),
   h('div', { class: 'item-main' },
-    h('div', { class: 'item-top' }, h('span', { class: 'item-name', text: m.dir === 'out' ? '→ ' + m.addr : m.addr })),
+    h('div', { class: 'item-top' }, h('span', { class: 'item-name', text: m.dir === 'out' ? '→ ' + name : name })),
     h('div', { class: 'item-snippet', text: m.text })),
   h('div', { class: 'item-side' },
     h('span', { class: 'item-time', text: shortTime(m.time), title: fullTime(m.time) }),
@@ -256,7 +391,7 @@ function renderDetail(allThreads) {
   const shown = Boolean(t);
   $('empty-detail').hidden = shown;
   $('detail-head').hidden = !shown;
-  $('composer').hidden = !shown || !isPhone(t?.name) && !t?.items.some((i) => isPhone(i.addr));
+  $('composer').hidden = !shown || !t.items.some((i) => isPhone(i.addr));
   const conv = $('conversation');
   if (!shown) {
     conv.replaceChildren();
@@ -264,8 +399,11 @@ function renderDetail(allThreads) {
   }
   $('detail-avatar').replaceWith(Object.assign(avatar(t.name, t.key), { id: 'detail-avatar' }));
   $('detail-name').textContent = t.name;
-  $('detail-sub').textContent = `${t.items.filter((i) => i.dir === 'in').length} входящих · ${t.items.filter((i) => i.dir === 'out').length} исходящих`;
+  const counts = `${t.items.filter((i) => i.dir === 'in').length} входящих · ${t.items.filter((i) => i.dir === 'out').length} исходящих`;
+  $('detail-sub').textContent = t.contact ? `${t.addr} · ${counts}` : counts;
   $('thread-unread').hidden = !t.items.some((i) => i.dir === 'in');
+  $('thread-contact').hidden = !isPhone(t.addr);
+  $('thread-contact').textContent = t.contact ? 'Контакт' : 'В контакты';
 
   const nearBottom = conv.scrollHeight - conv.scrollTop - conv.clientHeight < 80;
   const prevScroll = conv.scrollTop;
@@ -292,7 +430,8 @@ function bubble(it) {
   const pending = busyNow();
   if (it.dir === 'out') {
     const label = it.kind === 'forward' ? h('div', { class: 'label' }, icon('forward'), `Пересылка SMS от ${it.from || '—'}`)
-      : it.kind === 'forward-test' ? h('div', { class: 'label' }, icon('forward'), 'Тест пересылки') : null;
+      : it.kind === 'forward-batch' ? h('div', { class: 'label' }, icon('forward'), `Пересылка: ${it.count} ${plural(it.count, 'сообщение', 'сообщения', 'сообщений')}`)
+        : it.kind === 'forward-test' ? h('div', { class: 'label' }, icon('forward'), 'Тест пересылки') : null;
     return h('div', { class: `bubble out${it.status === 'error' ? ' err' : ''}${it.status === 'pending' ? ' pending' : ''}`, 'data-id': it.id },
       label,
       h('div', { class: 'text', text: it.text }),
@@ -312,16 +451,17 @@ function bubble(it) {
       h('span', { text: hhmm(it.time), title: fullTime(it.time) }),
       h('span', { class: 'bubble-actions' },
         h('button', { type: 'button', title: 'Копировать', 'aria-label': 'Копировать текст', onclick: () => copy(it.text) }, icon('copy')),
-        canForward ? h('button', { type: 'button', disabled: pending, title: 'Переслать на ' + data.forwarding.number, onclick: () => forwardOne(it) }, icon('forward'), 'Переслать') : null,
+        canForward ? h('button', { type: 'button', disabled: pending, title: 'Переслать на ' + displayName(data.forwarding.number), onclick: () => forwardOne(it) }, icon('forward'), 'Переслать') : null,
         h('button', { type: 'button', onclick: () => setRead(it.ids, !it.read, true), text: it.read ? 'Непрочитано' : 'Прочитано' }))));
 }
 
 // --- rendering: pages --------------------------------------------------------------
 
 const KIND = {
-  send: (r) => `SMS → ${r.number}`,
-  forward: (r) => `Пересылка → ${r.number}${r.sender ? ' · от ' + r.sender : ''}`,
-  'forward-test': (r) => `Тест пересылки → ${r.number}`,
+  send: (r) => `SMS → ${displayName(r.number)}`,
+  forward: (r) => `Пересылка → ${displayName(r.number)}${r.sender ? ' · от ' + r.sender : ''}`,
+  'forward-batch': (r) => `Пересылка ${r.count} ${plural(r.count, 'сообщения', 'сообщений', 'сообщений')} → ${displayName(r.number)}`,
+  'forward-test': (r) => `Тест пересылки → ${displayName(r.number)}`,
   ussd: (r) => `USSD ${r.code}`,
   sync: () => 'Обновление',
   clear: () => 'Очистка SIM',
@@ -334,6 +474,7 @@ function opRow(op) {
   const body = [];
   if (op.kind === 'send') body.push(req.text);
   if (op.kind === 'forward' || op.kind === 'forward-test') body.push((req.parts || []).join('\n'));
+  if (op.kind === 'forward-batch') body.push((req.items || []).map((i) => i.parts.join('\n')).join('\n\n'));
   if (op.status === 'pending') body.push('Выполняется…');
   else if (op.result?.text) body.push((body.length ? '→ ' : '') + op.result.text);
   const via = String(req.via || '');
@@ -357,7 +498,7 @@ function renderPages() {
   const f = data.forwarding;
   const pill = $('fwd-pill');
   pill.className = 'pill ' + (f.enabled ? 'ok' : '');
-  pill.textContent = f.enabled ? `включена → ${f.number}` : 'выключена';
+  pill.textContent = f.enabled ? `включена → ${displayName(f.number)}` : 'выключена';
   if (!fwdDirty) {
     $('fwd-enabled').checked = f.enabled;
     $('fwd-number').value = f.number || '';
@@ -388,6 +529,10 @@ function renderPages() {
     $('limit-day').value = String(l.reset_day);
   }
 
+  setRadio('theme-choice', prefs.get('theme', ''));
+  $('contact-options').replaceChildren(...data.contacts.map((c) => h('option', { value: c.number, label: c.name })));
+  renderContacts();
+
   const api = $('api-pill');
   api.className = 'pill ' + (data.api_enabled ? 'ok' : 'warn');
   api.textContent = data.api_enabled ? 'токены выпущены' : 'токенов нет';
@@ -411,10 +556,42 @@ function renderStatus() {
     $(id).textContent = unread > 99 ? '99+' : unread;
   }
   $('chip-unread').textContent = unread ? unread : '';
-  $('read-all').hidden = !unread;
   document.title = unread ? `(${unread}) SMS Gateway` : 'SMS Gateway';
   const disabled = busyNow();
   for (const el of document.querySelectorAll('#composer-send, #compose-send, [data-ussd], #ussd-form button, #sim-clear, #fwd-test, #sync')) el.disabled = disabled;
+}
+
+function renderContacts() {
+  const list = $('contacts-list');
+  const q = ui.contactQ.trim().toLowerCase();
+  const counts = new Map();
+  for (const m of data.messages) {
+    if (isPhone(m.sender)) counts.set(digits10(m.sender), (counts.get(digits10(m.sender)) || 0) + 1);
+  }
+  const shown = data.contacts.filter((c) => !q || [c.name, c.number, c.note].some((v) => String(v || '').toLowerCase().includes(q)))
+    .sort((a, b) => a.name.localeCompare(b.name, 'ru', { sensitivity: 'base' }));
+  $('contacts-count').textContent = data.contacts.length
+    ? `${data.contacts.length} ${plural(data.contacts.length, 'контакт', 'контакта', 'контактов')}` : 'Контактов пока нет';
+  list.replaceChildren();
+  let letter = null;
+  for (const c of shown) {
+    const first = (c.name.trim()[0] || '#').toUpperCase();
+    if (first !== letter) { list.append(h('div', { class: 'letter', text: first })); letter = first; }
+    const key = 'n:' + digits10(c.number);
+    const n = counts.get(digits10(c.number)) || 0;
+    list.append(h('div', { class: 'contact' },
+      avatar(c.name, key),
+      h('button', { class: 'contact-main', type: 'button', onclick: () => openContact(c) },
+        h('strong', { text: c.name }),
+        h('small', { text: c.number + (c.note ? ' · ' + c.note : '') })),
+      h('div', { class: 'contact-actions' },
+        n ? h('button', { class: 'ghost sm', type: 'button', title: 'Открыть переписку', onclick: () => { setView('messages'); openThread(key); } },
+          icon('chat'), String(n)) : null,
+        h('button', { class: 'ghost sm icon', type: 'button', title: 'Написать', 'aria-label': `Написать ${c.name}`, onclick: () => openCompose(c.number) }, icon('send')))));
+  }
+  if (!shown.length) {
+    list.append(h('div', { class: 'empty', text: q ? 'Ничего не найдено' : 'Импортируйте файл с контактами или добавьте контакт вручную' }));
+  }
 }
 
 const busyNow = () => busy || Boolean(data?.operations.some((o) => o.status === 'pending'));
@@ -422,9 +599,11 @@ const busyNow = () => busy || Boolean(data?.operations.some((o) => o.status === 
 function render(force = false) {
   if (!data) return;
   renderStatus();
-  const signature = JSON.stringify([data.messages, data.sent, data.operations, data.forwarding, data.limits, ui.group, ui.filter, ui.sort, ui.q, ui.selected, busyNow()]);
+  const signature = JSON.stringify([data.messages, data.sent, data.operations, data.forwarding, data.limits, data.contacts,
+    ui.group, ui.filter, ui.sort, ui.q, ui.contactQ, ui.selected, ui.selecting, [...ui.sel], busyNow()]);
   if (!force && signature === lastSignature) return;
   lastSignature = signature;
+  indexContacts();
   let all = items();
   let allThreads = threads(all);
   if (autoRead(allThreads)) {
@@ -432,6 +611,7 @@ function render(force = false) {
     allThreads = threads(all);
     renderStatus();
   }
+  current = { items: all, threads: allThreads };
   renderList(all, allThreads);
   renderDetail(allThreads);
   renderPages();
@@ -534,7 +714,7 @@ async function copy(text) {
 
 function forwardOne(it) {
   const number = data.forwarding.number;
-  if (confirm(`Переслать сообщение от ${it.addr} на ${number}? Будет отправлено SMS по тарифу оператора.`)) {
+  if (confirm(`Переслать сообщение от ${displayName(it.addr)} на ${displayName(number)}? Будет отправлено SMS по тарифу оператора.`)) {
     action('forward', { message_id: it.id }, 'Пересылка поставлена в очередь');
   }
 }
@@ -551,7 +731,8 @@ function checkSms(number, text) {
 async function sendSms(number, text) {
   const problem = checkSms(number, text);
   if (problem) { toast(problem, true); return false; }
-  if (!confirm(`Отправить SMS на ${number}?`)) return false;
+  const name = displayName(number);
+  if (!confirm(`Отправить SMS ${name === number ? 'на ' + number : name + ' (' + number + ')'}?`)) return false;
   return action('send', { number, text }, 'SMS передано модему');
 }
 
@@ -564,7 +745,7 @@ function threadNumber() {
 function setView(view) {
   ui.view = view;
   $('app').dataset.view = view;
-  for (const v of ['messages', 'ussd', 'journal', 'settings']) $('view-' + v).hidden = v !== view;
+  for (const v of ['messages', 'contacts', 'ussd', 'journal', 'settings']) $('view-' + v).hidden = v !== view;
   for (const b of document.querySelectorAll('[data-nav]')) b.classList.toggle('active', b.dataset.nav === view);
   render(true);
 }
@@ -576,6 +757,47 @@ function setRadio(groupId, value) {
 function applyTheme(theme) {
   if (theme) document.documentElement.dataset.theme = theme;
   else delete document.documentElement.dataset.theme;
+}
+
+function plural(n, one, few, many) {
+  const m10 = n % 10;
+  const m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return one;
+  return m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many;
+}
+
+function resolveNumber(value) {
+  const v = value.trim();
+  if (isPhone(v)) return v.replace(/[\s()-]/g, '');
+  const c = data.contacts.find((x) => x.name.toLowerCase() === v.toLowerCase());
+  return c ? c.number : v;
+}
+
+function openCompose(number = threadNumber()) {
+  $('compose-number').value = number;
+  $('compose-dialog').showModal();
+  ($('compose-number').value ? $('compose-text') : $('compose-number')).focus();
+}
+
+function openContact(contact, number = '') {
+  ui.editContact = contact ? contact.id : null;
+  $('contact-title').textContent = contact ? 'Контакт' : 'Новый контакт';
+  $('contact-name').value = contact?.name || '';
+  $('contact-number').value = contact?.number || number;
+  $('contact-note').value = contact?.note || '';
+  $('contact-delete').hidden = !contact;
+  $('contact-dialog').showModal();
+  $('contact-name').focus();
+}
+
+async function readTextFile(file) {
+  const buffer = await file.arrayBuffer();
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+  } catch {
+    // Older Windows exports of CSV are in cp1251.
+    return new TextDecoder('windows-1251').decode(buffer);
+  }
 }
 
 function autosize(el) {
@@ -621,6 +843,118 @@ function init() {
     const next = dark ? 'light' : 'dark';
     prefs.set('theme', next);
     applyTheme(next);
+    setRadio('theme-choice', next);
+  });
+  $('theme-choice').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-value]');
+    if (!b) return;
+    prefs.set('theme', b.dataset.value);
+    applyTheme(b.dataset.value);
+    setRadio('theme-choice', b.dataset.value);
+  });
+
+  const settingsView = $('view-settings');
+  const settingsLinks = [...$('settings-nav').querySelectorAll('a')];
+  for (const a of settingsLinks) {
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (a.dataset.go) { setView(a.dataset.go); return; }
+      document.querySelector(a.getAttribute('href')).scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  }
+  settingsView.addEventListener('scroll', () => {
+    const top = settingsView.getBoundingClientRect().top;
+    let active = settingsLinks[0].getAttribute('href');
+    for (const s of settingsView.querySelectorAll('.set-section')) if (s.getBoundingClientRect().top - top < 140) active = '#' + s.id;
+    if (settingsView.scrollTop + settingsView.clientHeight >= settingsView.scrollHeight - 4) active = '#set-look';
+    for (const a of settingsLinks) a.classList.toggle('active', a.getAttribute('href') === active);
+  });
+
+  $('select-toggle').addEventListener('click', () => {
+    if (ui.selecting) { exitSelect(); return; }
+    enterSelect();
+    render(true);
+  });
+  $('bulk-cancel').addEventListener('click', exitSelect);
+  $('bulk-all').addEventListener('click', () => {
+    const all = [...ui.selectable].every((k) => ui.sel.has(k));
+    if (all) ui.sel.clear(); else for (const k of ui.selectable) ui.sel.add(k);
+    render(true);
+  });
+  $('bulk-read').addEventListener('click', () => setRead(selectedMessages().flatMap((m) => m.ids), true));
+  $('bulk-unread').addEventListener('click', () => setRead(selectedMessages().flatMap((m) => m.ids), false, true));
+  $('bulk-forward').addEventListener('click', async () => {
+    const msgs = selectedMessages();
+    const number = data.forwarding.number;
+    if (!number) { toast('Сначала укажите номер в Настройках → Пересылка SMS', true); return; }
+    if (msgs.length > 20) { toast('За раз можно переслать не больше 20 сообщений', true); return; }
+    const word = plural(msgs.length, 'сообщение', 'сообщения', 'сообщений');
+    if (!confirm(`Переслать ${msgs.length} ${word} на ${displayName(number)}? Каждое уходит отдельным платным SMS, длинные — несколькими.`)) return;
+    if (await action('forward-batch', { message_ids: msgs.map((m) => m.id) }, 'Пересылка поставлена в очередь')) exitSelect();
+  });
+  $('bulk-delete').addEventListener('click', async () => {
+    const msgs = selectedMessages();
+    const word = plural(msgs.length, 'сообщение', 'сообщения', 'сообщений');
+    if (!confirm(`Удалить из архива ${msgs.length} ${word}? Восстановить их будет нельзя. Отправленные SMS останутся в журнале.`)) return;
+    try {
+      const r = await post('/api/delete', { ids: msgs.map((m) => m.id), confirm: true });
+      toast(`Удалено: ${r.deleted}`);
+      exitSelect();
+      await refresh();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && ui.selecting && !document.querySelector('dialog[open]')) exitSelect();
+  });
+
+  $('thread-contact').addEventListener('click', () => {
+    const t = current.threads.find((x) => x.key === ui.selected);
+    if (t) openContact(t.contact, t.contact ? '' : String(t.addr));
+  });
+  $('contacts-search').addEventListener('input', () => { ui.contactQ = $('contacts-search').value; render(true); });
+  $('contact-add').addEventListener('click', () => openContact(null));
+  $('contact-close').addEventListener('click', () => $('contact-dialog').close());
+  $('contact-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const saved = await post('/api/contacts/save', {
+        id: ui.editContact, name: $('contact-name').value, number: $('contact-number').value, note: $('contact-note').value,
+      });
+      $('contact-dialog').close();
+      toast(`Сохранено: ${saved.name}`);
+      await refresh();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+  $('contact-delete').addEventListener('click', async () => {
+    if (!confirm(`Удалить контакт «${$('contact-name').value}»? Переписка останется, но будет показываться номер.`)) return;
+    try {
+      await post('/api/contacts/delete', { ids: [ui.editContact] });
+      $('contact-dialog').close();
+      toast('Контакт удалён');
+      await refresh();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+  $('contacts-import').addEventListener('click', () => $('contacts-file').click());
+  $('contacts-file').addEventListener('change', async () => {
+    const file = $('contacts-file').files[0];
+    $('contacts-file').value = '';
+    if (!file) return;
+    if (file.size > 1.5 * 1024 * 1024) { toast('Файл больше 1,5 МБ', true); return; }
+    const overwrite = data.contacts.length > 0
+      && confirm('Если номер уже есть в контактах, заменить его имя на имя из файла?\nОК — заменить, Отмена — оставить прежние имена.');
+    try {
+      const r = await post('/api/contacts/import', { filename: file.name, content: await readTextFile(file), overwrite });
+      toast(`Номеров в файле: ${r.found}. Добавлено: ${r.added}, обновлено: ${r.updated}, без изменений: ${r.skipped}`);
+      await refresh();
+    } catch (err) {
+      toast(err.message, true);
+    }
   });
 
   const updateComposer = bindCounter($('composer-text'), $('composer-count'));
@@ -641,18 +975,13 @@ function init() {
 
   const dialog = $('compose-dialog');
   const updateCompose = bindCounter($('compose-text'), $('compose-count'));
-  const openCompose = () => {
-    $('compose-number').value = threadNumber();
-    dialog.showModal();
-    ($('compose-number').value ? $('compose-text') : $('compose-number')).focus();
-  };
-  $('compose-open').addEventListener('click', openCompose);
-  $('compose-fab').addEventListener('click', openCompose);
+  $('compose-open').addEventListener('click', () => openCompose());
+  $('compose-fab').addEventListener('click', () => openCompose());
   $('compose-close').addEventListener('click', () => dialog.close());
   $('compose-translit').addEventListener('click', () => { $('compose-text').value = translit($('compose-text').value); updateCompose(); });
   $('compose-form').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const number = $('compose-number').value.trim();
+    const number = resolveNumber($('compose-number').value);
     if (await sendSms(number, $('compose-text').value)) {
       dialog.close();
       $('compose-text').value = '';

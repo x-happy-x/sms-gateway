@@ -19,6 +19,7 @@
     <button class="compose-btn" id="compose-open" type="button"><span class="i i-pen" aria-hidden="true"></span><span>Написать</span></button>
     <div class="nav">
       <button type="button" data-nav="messages" class="active"><span class="i i-inbox" aria-hidden="true"></span><span>Сообщения</span><b class="badge" id="nav-unread" hidden></b></button>
+      <button type="button" data-nav="contacts"><span class="i i-user" aria-hidden="true"></span><span>Контакты</span></button>
       <button type="button" data-nav="ussd"><span class="i i-hash" aria-hidden="true"></span><span>USSD</span></button>
       <button type="button" data-nav="journal"><span class="i i-clock" aria-hidden="true"></span><span>Журнал</span></button>
       <button type="button" data-nav="settings"><span class="i i-gear" aria-hidden="true"></span><span>Настройки</span></button>
@@ -64,8 +65,22 @@
       <div class="list-actions">
         <small id="list-count"></small>
         <button type="button" class="link" id="read-all">Прочитать все</button>
+        <button type="button" class="link" id="select-toggle">Выбрать</button>
       </div>
       <div class="list" id="list" role="list"></div>
+      <div class="bulk-bar" id="bulk-bar" hidden>
+        <div class="bulk-top">
+          <button type="button" class="ghost sm icon" id="bulk-cancel" aria-label="Снять выделение"><span class="i i-close" aria-hidden="true"></span></button>
+          <span class="bulk-count" id="bulk-count">Ничего не выбрано</span>
+          <button type="button" class="link" id="bulk-all">Выбрать все</button>
+        </div>
+        <div class="bulk-actions">
+          <button type="button" class="ghost sm" id="bulk-read"><span class="i i-check" aria-hidden="true"></span><span>Прочитано</span></button>
+          <button type="button" class="ghost sm" id="bulk-unread"><span class="i i-dot" aria-hidden="true"></span><span>Непрочитано</span></button>
+          <button type="button" class="ghost sm" id="bulk-forward"><span class="i i-forward" aria-hidden="true"></span><span>Переслать</span></button>
+          <button type="button" class="ghost sm danger" id="bulk-delete"><span class="i i-trash" aria-hidden="true"></span><span>Удалить</span></button>
+        </div>
+      </div>
     </section>
 
     <section class="pane detail-pane" aria-label="Диалог" id="detail">
@@ -77,6 +92,7 @@
         <button type="button" class="ghost icon back" id="back" aria-label="Назад"><span class="i i-back" aria-hidden="true"></span></button>
         <div class="avatar" id="detail-avatar"></div>
         <div class="detail-title"><strong id="detail-name"></strong><small id="detail-sub"></small></div>
+        <button type="button" class="ghost sm" id="thread-contact"></button>
         <button type="button" class="ghost sm" id="thread-unread">Непрочитано</button>
       </header>
       <div class="conversation" id="conversation" aria-live="polite"></div>
@@ -89,6 +105,20 @@
         </div>
       </form>
     </section>
+  </main>
+
+  <main class="view page contacts-page" id="view-contacts" hidden>
+    <header class="page-head contacts-head">
+      <div><h1>Контакты</h1><p id="contacts-count"></p></div>
+      <div class="head-actions">
+        <button type="button" class="ghost" id="contacts-import"><span class="i i-upload" aria-hidden="true"></span>Импорт</button>
+        <button type="button" class="primary" id="contact-add"><span class="i i-plus" aria-hidden="true"></span>Контакт</button>
+        <input type="file" id="contacts-file" accept=".vcf,.csv,text/vcard,text/x-vcard,text/csv" hidden>
+      </div>
+    </header>
+    <p class="hint contacts-hint">Импорт: файл vCard (.vcf) из телефона или CSV (например, экспорт Google Контактов). Номера совпадают по последним 10 цифрам, поэтому +7 и 8 — один номер.</p>
+    <label class="search contacts-search"><span class="i i-search" aria-hidden="true"></span><input id="contacts-search" type="search" placeholder="Поиск по имени, номеру, заметке" aria-label="Поиск контактов"></label>
+    <div class="contacts-list" id="contacts-list"></div>
   </main>
 
   <main class="view page" id="view-ussd" hidden>
@@ -117,70 +147,121 @@
     <section class="card"><div id="journal" class="op-list"></div></section>
   </main>
 
-  <main class="view page" id="view-settings" hidden>
+  <main class="view page settings-page" id="view-settings" hidden>
     <header class="page-head"><h1>Настройки</h1></header>
-    <div class="cards">
-      <section class="card">
-        <div class="card-head"><h2>Пересылка SMS</h2><span class="pill" id="fwd-pill"></span></div>
-        <p class="muted">Новые входящие отправляются на указанный номер отдельными SMS. RouterOS отправляет только латиницу, поэтому текст транслитерируется, длинные сообщения делятся на части. Пересылаются только сообщения, пришедшие после включения; неудачные отправки не повторяются автоматически.</p>
-        <form id="fwd-form" class="stack">
-          <label class="switch"><input type="checkbox" id="fwd-enabled"><span></span>Пересылать входящие</label>
-          <label for="fwd-number">Номер получателя</label>
-          <input id="fwd-number" type="tel" inputmode="tel" placeholder="+79990000000" pattern="\+?[0-9]{3,15}">
-          <label for="fwd-parts">Не больше SMS на одно сообщение</label>
-          <select id="fwd-parts"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
-          <div class="field-row">
-            <button type="submit" class="primary">Сохранить</button>
-            <button type="button" class="ghost" id="fwd-test">Отправить тест</button>
+    <div class="settings">
+      <nav class="settings-nav" id="settings-nav" aria-label="Разделы настроек">
+        <a href="#set-forward" class="active"><span class="i i-forward" aria-hidden="true"></span>Пересылка</a>
+        <a href="#set-limit"><span class="i i-gauge" aria-hidden="true"></span>Лимит SMS</a>
+        <a href="#set-sim"><span class="i i-sim" aria-hidden="true"></span>SIM-карта</a>
+        <a href="#set-api"><span class="i i-code" aria-hidden="true"></span>API</a>
+        <a href="#set-look"><span class="i i-theme" aria-hidden="true"></span>Оформление</a>
+        <a href="#journal" data-go="journal" class="nav-journal"><span class="i i-clock" aria-hidden="true"></span>Журнал операций</a>
+      </nav>
+      <div class="settings-body">
+        <section class="set-section" id="set-forward">
+          <div class="set-head"><h2>Пересылка SMS</h2><span class="pill" id="fwd-pill"></span></div>
+          <p class="set-lead">Новые входящие уходят на другой номер отдельными SMS. RouterOS отправляет только латиницу, поэтому текст транслитерируется, а длинные сообщения делятся на части. Неудачная пересылка не повторяется автоматически.</p>
+          <form id="fwd-form" class="set-list">
+            <label class="set-row" for="fwd-enabled">
+              <span class="set-text"><strong>Пересылать входящие</strong><small>Только сообщения, пришедшие после включения</small></span>
+              <span class="switch"><input type="checkbox" id="fwd-enabled"><span></span></span>
+            </label>
+            <div class="set-row">
+              <label class="set-text" for="fwd-number"><strong>Номер получателя</strong><small>Сообщения с этого номера не пересылаются</small></label>
+              <input id="fwd-number" type="tel" inputmode="tel" placeholder="+79990000000" pattern="\+?[0-9]{3,15}">
+            </div>
+            <div class="set-row">
+              <label class="set-text" for="fwd-parts"><strong>SMS на одно сообщение</strong><small>Длиннее — обрезается с «...»</small></label>
+              <select id="fwd-parts"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
+            </div>
+            <div class="set-actions">
+              <button type="button" class="ghost" id="fwd-test">Отправить тест</button>
+              <button type="submit" class="primary">Сохранить</button>
+            </div>
+          </form>
+          <h3>Последние пересылки</h3>
+          <div id="fwd-history" class="op-list compact"></div>
+        </section>
+
+        <section class="set-section" id="set-limit">
+          <div class="set-head"><h2>Лимит SMS в месяц</h2><span class="pill" id="limit-pill"></span></div>
+          <p class="set-lead">Считается каждое SMS, подтверждённое RouterOS: из интерфейса, API и каждая часть пересылки. При исчерпании отправка отклоняется, а новые сообщения не пересылаются и не копятся до обновления.</p>
+          <div class="set-list">
+            <div class="set-row set-usage">
+              <span class="set-text"><strong>Отправлено за период</strong><small id="limit-note"></small></span>
+              <span class="set-value" id="limit-big">—</span>
+            </div>
+            <div class="meter" aria-hidden="true"><i id="limit-meter"></i></div>
+            <span id="limit-sub" hidden></span>
           </div>
-        </form>
-        <h3>Последние пересылки</h3>
-        <div id="fwd-history" class="op-list compact"></div>
-      </section>
-      <section class="card">
-        <div class="card-head"><h2>Лимит SMS в месяц</h2><span class="pill" id="limit-pill"></span></div>
-        <div class="sim-big"><strong id="limit-big">—</strong><span id="limit-sub">отправлено в этом периоде</span></div>
-        <div class="meter large" aria-hidden="true"><i id="limit-meter"></i></div>
-        <p class="muted" id="limit-note"></p>
-        <form id="limit-form" class="stack">
-          <label for="limit-monthly">Не больше SMS за период (0 — без ограничения)</label>
-          <input id="limit-monthly" type="number" min="0" max="100000" step="1" inputmode="numeric" required>
-          <label for="limit-day">Лимит обновляется</label>
-          <select id="limit-day"></select>
-          <p class="hint">Считается каждое SMS, подтверждённое RouterOS: отправка из интерфейса и API, каждая часть пересылки. При исчерпании отправка отклоняется, а новые сообщения не пересылаются и не копятся до обновления лимита.</p>
-          <div class="field-row"><button type="submit" class="primary">Сохранить</button></div>
-        </form>
-      </section>
-      <section class="card">
-        <h2>Память SIM</h2>
-        <div class="sim-big"><strong id="sim-big">—</strong><span>ячеек занято</span></div>
-        <div class="meter large" aria-hidden="true"><i id="sim-meter-big"></i></div>
-        <p class="muted">SMS проверяются каждые 30 секунд. После сохранения в архив сообщения удаляются с SIM; сообщения с ошибкой декодирования остаются на SIM для проверки.</p>
-        <button type="button" class="ghost" id="sim-clear">Проверить и освободить SIM</button>
-      </section>
-      <section class="card api-card">
-        <div class="card-head"><h2>API</h2><span class="pill" id="api-pill"></span></div>
-        <p class="muted">Доступ по токену: <code>Authorization: Bearer &lt;token&gt;</code>. Токен выпускается на роутере и показывается один раз:</p>
-        <pre>/opt/bin/python3 /opt/sms-gateway/server.py token add my-service
+          <form id="limit-form" class="set-list">
+            <div class="set-row">
+              <label class="set-text" for="limit-monthly"><strong>Лимит</strong><small>0 — без ограничения</small></label>
+              <input id="limit-monthly" type="number" min="0" max="100000" step="1" inputmode="numeric" required>
+            </div>
+            <div class="set-row">
+              <label class="set-text" for="limit-day"><strong>Обновление лимита</strong><small>День месяца, с которого начинается новый период</small></label>
+              <select id="limit-day"></select>
+            </div>
+            <div class="set-actions"><button type="submit" class="primary">Сохранить</button></div>
+          </form>
+        </section>
+
+        <section class="set-section" id="set-sim">
+          <div class="set-head"><h2>SIM-карта</h2></div>
+          <p class="set-lead">SMS проверяются каждые 30 секунд. После сохранения в архив сообщения удаляются с SIM; сообщения с ошибкой декодирования остаются на SIM для проверки.</p>
+          <div class="set-list">
+            <div class="set-row set-usage">
+              <span class="set-text"><strong>Занято ячеек</strong><small>Когда память заполнена, новые SMS не принимаются</small></span>
+              <span class="set-value" id="sim-big">—</span>
+            </div>
+            <div class="meter" aria-hidden="true"><i id="sim-meter-big"></i></div>
+            <div class="set-row">
+              <span class="set-text"><strong>Освободить память</strong><small>Удаляет с SIM только уже сохранённые в архив сообщения</small></span>
+              <button type="button" class="ghost" id="sim-clear">Проверить и освободить</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="set-section" id="set-api">
+          <div class="set-head"><h2>API</h2><span class="pill" id="api-pill"></span></div>
+          <p class="set-lead">Доступ по токену в заголовке <code>Authorization: Bearer &lt;token&gt;</code>. Токен выпускается на роутере и показывается один раз:</p>
+          <pre>/opt/bin/python3 /opt/sms-gateway/server.py token add my-service
 /opt/etc/init.d/S99sms-gateway restart</pre>
-        <table class="endpoints">
-          <tr><td><b>GET</b></td><td><code>/api/v1/messages</code><small>unread=1, sender, since, order=asc, limit, offset</small></td></tr>
-          <tr><td><b>GET</b></td><td><code>/api/v1/messages/{id}</code></td></tr>
-          <tr><td><b>POST</b></td><td><code>/api/v1/messages/read</code><small>{"ids":[1,2],"read":true}</small></td></tr>
-          <tr><td><b>POST</b></td><td><code>/api/v1/send</code><small>{"number":"+7…","text":"…","id":"опционально"}</small></td></tr>
-          <tr><td><b>GET</b></td><td><code>/api/v1/operations/{id}</code><small>статус отправки</small></td></tr>
-          <tr><td><b>GET</b></td><td><code>/api/v1/limits</code><small>месячный лимит и остаток; при исчерпании send отвечает 429</small></td></tr>
-        </table>
-        <pre id="api-example"></pre>
-      </section>
+          <div class="set-list endpoints">
+            <div class="set-row"><span class="set-text"><code>GET /api/v1/messages</code><small>unread=1, sender, since, order=asc, limit, offset</small></span></div>
+            <div class="set-row"><span class="set-text"><code>GET /api/v1/messages/{id}</code><small>одно сообщение</small></span></div>
+            <div class="set-row"><span class="set-text"><code>POST /api/v1/messages/read</code><small>{"ids":[1,2],"read":true}</small></span></div>
+            <div class="set-row"><span class="set-text"><code>POST /api/v1/send</code><small>{"number":"+7…","text":"…","id":"необязательно"}</small></span></div>
+            <div class="set-row"><span class="set-text"><code>GET /api/v1/operations/{id}</code><small>статус отправки</small></span></div>
+            <div class="set-row"><span class="set-text"><code>GET /api/v1/limits</code><small>лимит и остаток; сверх лимита send отвечает 429</small></span></div>
+          </div>
+          <pre id="api-example"></pre>
+        </section>
+
+        <section class="set-section" id="set-look">
+          <div class="set-head"><h2>Оформление</h2></div>
+          <div class="set-list">
+            <div class="set-row">
+              <span class="set-text"><strong>Тема</strong><small>Хранится в этом браузере</small></span>
+              <div class="segmented" role="radiogroup" aria-label="Тема" id="theme-choice">
+                <button type="button" role="radio" data-value="">Системная</button>
+                <button type="button" role="radio" data-value="light">Светлая</button>
+                <button type="button" role="radio" data-value="dark">Тёмная</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
     </div>
   </main>
 
   <nav class="tabbar" aria-label="Разделы">
     <button type="button" data-nav="messages" class="active"><span class="i i-inbox" aria-hidden="true"></span><span>SMS</span><b class="badge" id="tab-unread" hidden></b></button>
-    <button type="button" data-nav="ussd"><span class="i i-hash" aria-hidden="true"></span><span>USSD</span></button>
+    <button type="button" data-nav="contacts"><span class="i i-user" aria-hidden="true"></span><span>Контакты</span></button>
     <button type="button" class="fab" id="compose-fab" aria-label="Написать"><span class="i i-pen" aria-hidden="true"></span></button>
-    <button type="button" data-nav="journal"><span class="i i-clock" aria-hidden="true"></span><span>Журнал</span></button>
+    <button type="button" data-nav="ussd"><span class="i i-hash" aria-hidden="true"></span><span>USSD</span></button>
     <button type="button" data-nav="settings"><span class="i i-gear" aria-hidden="true"></span><span>Ещё</span></button>
   </nav>
 </div>
@@ -189,12 +270,30 @@
   <form method="dialog" id="compose-form" class="stack">
     <header class="sheet-head"><h2>Новое SMS</h2><button type="button" class="ghost icon" id="compose-close" aria-label="Закрыть"><span class="i i-close" aria-hidden="true"></span></button></header>
     <label for="compose-number">Номер получателя</label>
-    <input id="compose-number" type="tel" inputmode="tel" required pattern="\+?[0-9]{3,15}" placeholder="+79990000000">
+    <input id="compose-number" type="text" inputmode="tel" autocomplete="off" required list="contact-options" placeholder="+79990000000 или имя контакта">
+    <datalist id="contact-options"></datalist>
     <label for="compose-text">Сообщение</label>
     <textarea id="compose-text" rows="5" required placeholder="Текст SMS (латиница)"></textarea>
     <div class="composer-bar"><small id="compose-count">0 / 160</small><button type="button" class="ghost sm" id="compose-translit">В транслит</button></div>
     <p class="hint">Только GSM7 (латиница), до 160 единиц; ^ { } [ ] ~ | \ и € считаются за две. Стоимость — по тарифу оператора.</p>
     <button type="submit" class="primary wide" id="compose-send"><span class="i i-send" aria-hidden="true"></span>Отправить</button>
+  </form>
+</dialog>
+
+<dialog id="contact-dialog" class="sheet">
+  <form method="dialog" id="contact-form" class="stack">
+    <header class="sheet-head"><h2 id="contact-title">Контакт</h2><button type="button" class="ghost icon" id="contact-close" aria-label="Закрыть"><span class="i i-close" aria-hidden="true"></span></button></header>
+    <label for="contact-name">Имя</label>
+    <input id="contact-name" required maxlength="120" autocomplete="off">
+    <label for="contact-number">Номер</label>
+    <input id="contact-number" type="tel" inputmode="tel" required maxlength="24" autocomplete="off">
+    <label for="contact-note">Заметка</label>
+    <textarea id="contact-note" rows="2" maxlength="500"></textarea>
+    <div class="sheet-actions">
+      <button type="button" class="ghost danger" id="contact-delete"><span class="i i-trash" aria-hidden="true"></span>Удалить</button>
+      <span></span>
+      <button type="submit" class="primary">Сохранить</button>
+    </div>
   </form>
 </dialog>
 

@@ -53,6 +53,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, kind TEXT, request TEXT, status TEXT, result TEXT, added REAL);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS forwards (message_id INTEGER PRIMARY KEY, operation TEXT, status TEXT NOT NULL, added REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS contacts (id INTEGER PRIMARY KEY, name TEXT NOT NULL, number TEXT NOT NULL, key TEXT NOT NULL UNIQUE, note TEXT NOT NULL DEFAULT '', updated REAL NOT NULL);
             UPDATE operations SET status='unknown',result='{"text":"Сервис перезапущен во время операции. Проверьте результат перед повтором."}' WHERE status='pending';''')
             columns = {row['name'] for row in c.execute('PRAGMA table_info(sms)')}
             if 'read_at' not in columns:
@@ -135,6 +136,18 @@ class Store:
                 c.execute(f'UPDATE sms SET read_at=NULL WHERE id IN ({marks})', rows)
         return len(rows)
 
+    def delete_messages(self, ids):
+        """Deletes whole logical messages from the archive; returns how many were deleted."""
+        wanted = {int(i) for i in ids}
+        chosen = [m for m in self.messages() if wanted & set(m['ids'])]
+        rows = [i for m in chosen for i in m['ids']]
+        if not rows:
+            return 0
+        with self.tx() as c:
+            c.execute(f"DELETE FROM sms WHERE id IN ({','.join('?' * len(rows))})", rows)
+            c.execute(f"DELETE FROM forwards WHERE message_id IN ({','.join('?' * len(chosen))})", [m['id'] for m in chosen])
+        return len(chosen)
+
     # --- operations ---------------------------------------------------------
 
     def start_operation(self, oid, kind, request, exclusive=True):
@@ -181,6 +194,46 @@ class Store:
         with self.tx() as c:
             return c.execute('SELECT COUNT(*) FROM operations WHERE added>=? AND kind IN (%s)' % ','.join('?' * len(kinds)),
                              (since, *kinds)).fetchone()[0]
+
+    # --- contacts -----------------------------------------------------------
+
+    def contacts(self):
+        with self.tx() as c:
+            return [dict(r) for r in c.execute('SELECT id,name,number,note FROM contacts ORDER BY name COLLATE NOCASE, number')]
+
+    def save_contact(self, cid, name, number, note, key):
+        with self.tx(immediate=True) as c:
+            other = c.execute('SELECT id,name FROM contacts WHERE key=?', (key,)).fetchone()
+            if other and other['id'] != cid:
+                raise ValueError(f"Номер уже записан у контакта «{other['name']}»")
+            if cid is None:
+                cur = c.execute('INSERT INTO contacts(name,number,key,note,updated) VALUES(?,?,?,?,?)', (name, number, key, note, time.time()))
+                cid = cur.lastrowid
+            elif c.execute('UPDATE contacts SET name=?,number=?,key=?,note=?,updated=? WHERE id=?',
+                           (name, number, key, note, time.time(), cid)).rowcount == 0:
+                raise ValueError('Контакт не найден')
+        return cid
+
+    def delete_contacts(self, ids):
+        ids = [int(i) for i in ids]
+        with self.tx() as c:
+            return c.execute(f"DELETE FROM contacts WHERE id IN ({','.join('?' * len(ids))})", ids).rowcount
+
+    def import_contacts(self, items, overwrite=False):
+        """Adds (name, number, key) items; existing numbers keep their name unless overwrite."""
+        added = updated = skipped = 0
+        with self.tx(immediate=True) as c:
+            for name, number, key in items:
+                row = c.execute('SELECT id,name FROM contacts WHERE key=?', (key,)).fetchone()
+                if row is None:
+                    c.execute('INSERT INTO contacts(name,number,key,note,updated) VALUES(?,?,?,?,?)', (name, number, key, '', time.time()))
+                    added += 1
+                elif overwrite and row['name'] != name:
+                    c.execute('UPDATE contacts SET name=?,number=?,updated=? WHERE id=?', (name, number, time.time(), row['id']))
+                    updated += 1
+                else:
+                    skipped += 1
+        return {'added': added, 'updated': updated, 'skipped': skipped}
 
     # --- settings and forwards ----------------------------------------------
 

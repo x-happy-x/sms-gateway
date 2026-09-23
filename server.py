@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from contacts import normalize_number, number_key, parse_contacts
 from gateway import Gateway, LimitReached, validate_number, validate_sms, forward_parts
 from store import Busy, Store
 
@@ -26,8 +27,11 @@ STATIC = BASE / 'static'
 STATIC_TYPES = {'.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
                 '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml'}
 MAX_BODY = 16384
+MAX_IMPORT = 2 * 1024 * 1024
 OPERATION_ID = re.compile(r'[a-zA-Z0-9-]{16,80}')
-UI_KINDS = ('ussd', 'send', 'sync', 'clear', 'forward', 'forward-test')
+UI_KINDS = ('ussd', 'send', 'sync', 'clear', 'forward', 'forward-test', 'forward-batch')
+SENT_KINDS = ('send', 'forward', 'forward-test', 'forward-batch')
+MAX_BATCH = 20
 CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; "
        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
@@ -49,8 +53,10 @@ def token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-def public_message(m):
-    return {'id': m['id'], 'ids': m['ids'], 'sender': m['sender'], 'text': m['text'], 'timestamp': m['timestamp'],
+def public_message(m, names=None):
+    return {'id': m['id'], 'ids': m['ids'], 'sender': m['sender'],
+            'sender_name': (names or {}).get(number_key(m['sender'])) if normalize_number(m['sender']) else None,
+            'text': m['text'], 'timestamp': m['timestamp'],
             'received_at': m['added'], 'read': m['read'], 'parts': m.get('parts'), 'complete': m['complete'],
             'decode_error': bool(m.get('decode_error')), 'forward': m['forward']}
 
@@ -102,6 +108,22 @@ class App:
             if not settings['number']:
                 raise ValueError('Сначала укажите номер для пересылки')
             return self.gateway.forward_request(message, settings)
+        if kind == 'forward-batch':
+            ids = p.get('message_ids')
+            if not isinstance(ids, list) or not ids or not all(isinstance(i, int) for i in ids):
+                raise ValueError('message_ids: непустой список чисел')
+            if len(ids) > MAX_BATCH:
+                raise ValueError(f'За раз можно переслать не больше {MAX_BATCH} сообщений')
+            settings = self.store.forward_settings()
+            if not settings['number']:
+                raise ValueError('Сначала укажите номер для пересылки')
+            by_id = {m['id']: m for m in self.store.messages()}
+            missing = [i for i in ids if i not in by_id]
+            if missing:
+                raise ValueError(f'Сообщения не найдены: {missing}')
+            items = [self.gateway.forward_request(by_id[i], settings) for i in sorted(set(ids), key=lambda i: by_id[i]['added'])]
+            return {'number': settings['number'], 'count': len(items),
+                    'items': [{'message_id': it['message_id'], 'sender': it['sender'], 'parts': it['parts']} for it in items]}
         if kind == 'forward-test':
             settings = self.store.forward_settings()
             number = p.get('number') or settings['number']
@@ -121,6 +143,8 @@ class App:
                 self.gateway.ensure_quota(1)
             elif kind in ('forward', 'forward-test'):
                 self.gateway.ensure_quota(len(request['parts']))
+            elif kind == 'forward-batch':
+                self.gateway.ensure_quota(sum(len(item['parts']) for item in request['items']))
             created = self.store.start_operation(oid, kind, request)
         except LimitReached as e:
             raise HttpError(429, str(e))
@@ -156,11 +180,44 @@ class App:
 
     # --- queries ------------------------------------------------------------
 
+    def contact_names(self):
+        return {number_key(c['number']): c['name'] for c in self.store.contacts()}
+
+    def save_contact(self, p):
+        name = str(p.get('name') or '').strip()
+        number = normalize_number(p.get('number'))
+        note = str(p.get('note') or '').strip()
+        cid = p.get('id')
+        if not name or len(name) > 120:
+            raise ValueError('Имя: от 1 до 120 символов')
+        if not number:
+            raise ValueError('Номер: от 3 до 15 цифр, допустим + в начале')
+        if len(note) > 500:
+            raise ValueError('Заметка: до 500 символов')
+        if cid is not None and not isinstance(cid, int):
+            raise ValueError('id контакта должен быть числом')
+        cid = self.store.save_contact(cid, name, number, note, number_key(number))
+        return {'id': cid, 'name': name, 'number': number, 'note': note}
+
+    def import_contacts(self, p):
+        content = p.get('content')
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError('Файл пустой')
+        parsed = parse_contacts(str(p.get('filename') or ''), content)
+        if not parsed:
+            raise ValueError('В файле не найдено ни одного номера. Поддерживаются vCard (.vcf) и CSV.')
+        unique = {}
+        for item in parsed:
+            unique.setdefault(number_key(item['number']), (item['name'][:120], item['number'], number_key(item['number'])))
+        result = self.store.import_contacts(unique.values(), overwrite=p.get('overwrite') is True)
+        return {**result, 'found': len(unique)}
+
     def ui_state(self):
         return {
             'state': dict(self.gateway.state),
             'messages': [public_message(m) for m in self.store.messages()],
-            'sent': self.store.operations(300, kinds=('send', 'forward', 'forward-test')),
+            'contacts': self.store.contacts(),
+            'sent': self.store.operations(300, kinds=SENT_KINDS),
             'operations': self.store.operations(40),
             'forwarding': self.store.forward_settings(),
             'limits': self.gateway.limit_status(),
@@ -171,7 +228,8 @@ class App:
     def list_messages(self, query):
         def one(name, default=None):
             return query.get(name, [default])[0]
-        messages = [public_message(m) for m in self.store.messages()]
+        names = self.contact_names()
+        messages = [public_message(m, names) for m in self.store.messages()]
         unread = one('unread')
         if unread in ('1', 'true'):
             messages = [m for m in messages if not m['read']]
@@ -197,7 +255,8 @@ class App:
         return {'total': len(messages), 'messages': messages[offset:offset + limit]}
 
     def find_message(self, mid):
-        return next((public_message(m) for m in self.store.messages() if mid in m['ids']), None)
+        names = self.contact_names()
+        return next((public_message(m, names) for m in self.store.messages() if mid in m['ids']), None)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -218,9 +277,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def body(self):
+    def body(self, limit=MAX_BODY):
         n = int(self.headers.get('Content-Length', '0'))
-        if not 0 < n <= MAX_BODY:
+        if not 0 < n <= limit:
             raise ValueError('Недопустимый размер запроса')
         if not self.headers.get('Content-Type', '').startswith('application/json'):
             raise ValueError('Ожидается JSON')
@@ -264,6 +323,8 @@ class Handler(BaseHTTPRequestHandler):
             if m := re.fullmatch(r'/api/v1/messages/(\d+)', path):
                 message = app.find_message(int(m[1]))
                 return self.reply(200, message) if message else self.reply(404, {'error': 'Сообщение не найдено'})
+            if path == '/api/v1/contacts':
+                return self.reply(200, {'contacts': app.store.contacts()})
             if path == '/api/v1/limits':
                 return self.reply(200, app.gateway.limit_status())
             if m := re.fullmatch(r'/api/v1/operations/([a-zA-Z0-9-]{16,80})', path):
@@ -289,8 +350,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(404, {'error': 'Не найдено'})
         if not hmac.compare_digest(self.headers.get('X-CSRF-Token', ''), app.csrf):
             return self.reply(403, {'error': 'Обновите страницу'})
-        p = self.body()
         kind = path.removeprefix('/api/')
+        p = self.body(MAX_IMPORT if kind == 'contacts/import' else MAX_BODY)
         if kind in UI_KINDS:
             oid, created = app.submit(kind, p, 'ui')
             return self.reply(202 if created else 200, {'id': oid})
@@ -299,6 +360,22 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
                 raise ValueError('ids: список чисел')
             return self.reply(200, {'updated': app.store.mark_read(ids, p.get('read', True) is not False)})
+        if kind == 'contacts/save':
+            return self.reply(200, app.save_contact(p))
+        if kind == 'contacts/delete':
+            ids = p.get('ids')
+            if not isinstance(ids, list) or not ids or not all(isinstance(i, int) for i in ids):
+                raise ValueError('ids: непустой список чисел')
+            return self.reply(200, {'deleted': app.store.delete_contacts(ids)})
+        if kind == 'contacts/import':
+            return self.reply(200, app.import_contacts(p))
+        if kind == 'delete':
+            ids = p.get('ids')
+            if not isinstance(ids, list) or not ids or not all(isinstance(i, int) for i in ids):
+                raise ValueError('ids: непустой список чисел')
+            if p.get('confirm') is not True:
+                raise ValueError('Подтвердите удаление')
+            return self.reply(200, {'deleted': app.store.delete_messages(ids)})
         if kind == 'forwarding':
             return self.reply(200, app.save_forwarding(p))
         if kind == 'limits':

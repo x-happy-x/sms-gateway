@@ -8,6 +8,7 @@ import time
 import uuid
 from datetime import datetime
 
+from contacts import normalize_number, number_key
 from pdu import EXT, GSM, decode, ussd
 from store import period_bounds
 
@@ -224,6 +225,8 @@ class Gateway:
                         result = self.clear_archived(r)
                     elif kind in ('forward', 'forward-test'):
                         result = self.send_parts(r, payload['number'], payload['parts'], oid)
+                    elif kind == 'forward-batch':
+                        result = self.forward_batch(r, payload, oid)
                     else:
                         self.archive(r)
                         result = {'text': 'SMS обновлены'}
@@ -236,11 +239,32 @@ class Gateway:
         if kind == 'forward' and payload.get('message_id'):
             self.store.record_forward(payload['message_id'], oid, status)
 
+    def forward_batch(self, r, payload, oid):
+        """Forwards several messages in one operation; stops at the first failure."""
+        items = payload['items']
+        self.ensure_quota(sum(len(item['parts']) for item in items))
+        done = 0
+        for item in items:
+            self.store.record_forward(item['message_id'], oid, 'pending')
+            try:
+                self.send_parts(r, payload['number'], item['parts'], oid)
+            except Exception as e:
+                self.store.record_forward(item['message_id'], oid, 'error')
+                raise RuntimeError(f'Переслано сообщений: {done} из {len(items)}. {e}') from e
+            self.store.record_forward(item['message_id'], oid, 'done')
+            done += 1
+        return {'text': f'Переслано сообщений: {done} на {payload["number"]}. Это подтверждение RouterOS, а не доставки.'}
+
     def forward_request(self, message, settings):
         number = settings['number']
         validate_number(number)
-        return {'message_id': message['id'], 'number': number, 'sender': message['sender'],
-                'parts': forward_parts(message, int(settings.get('max_parts') or 3))}
+        sender = message['sender']
+        if normalize_number(sender):
+            name = next((c['name'] for c in self.store.contacts() if number_key(c['number']) == number_key(sender)), None)
+            if name:
+                sender = f'{name} ({sender})'
+        return {'message_id': message['id'], 'number': number, 'sender': sender,
+                'parts': forward_parts(dict(message, sender=sender), int(settings.get('max_parts') or 3))}
 
     def process_forwards(self, r):
         """Forwards new messages when enabled; never retries a failed send automatically."""

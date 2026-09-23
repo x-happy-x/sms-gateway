@@ -35,6 +35,9 @@ artifacts:
   - source: routeros.py
     destination: /opt/sms-gateway/routeros.py
     mode: 0644
+  - source: contacts.py
+    destination: /opt/sms-gateway/contacts.py
+    mode: 0644
   - source: static
     destination: /opt/sms-gateway/static
     mode: 0755
