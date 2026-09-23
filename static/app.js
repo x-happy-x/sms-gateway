@@ -169,7 +169,7 @@ function items() {
         : (req.parts || []).join('\n');
     out.push({
       dir: 'out', id: op.id, addr: req.number, kind: op.kind, status: op.status, result: op.result?.text,
-      text, from: req.sender, count: req.count, via: req.via, time: op.added * 1000, read: true,
+      text, from: req.sender, count: req.count, via: req.via, time: op.added * 1000, read: true, delivery: op.delivery,
     });
   }
   return out;
@@ -384,6 +384,15 @@ function messageRow(m) {
 // --- rendering: conversation -----------------------------------------------------
 
 const STATUS = { done: 'отправлено', error: 'ошибка', pending: 'отправка…', unknown: 'результат неизвестен' };
+
+function deliveryLabel(status, d) {
+  if (status !== 'done' || !d) return { text: STATUS[status] || status, cls: '' };
+  const partial = d.total > 1 ? ` ${d.delivered}/${d.total}` : '';
+  if (d.state === 'delivered') return { text: 'доставлено ✓✓', cls: 'ok', title: d.at ? 'Доставлено ' + fullTime(Date.parse(d.at)) : '' };
+  if (d.state === 'failed') return { text: 'не доставлено' + partial, cls: 'err', title: d.text || '' };
+  if (d.state === 'pending') return { text: d.delivered ? 'доставлено' + partial : 'отправлено · ждём отчёт', cls: '', title: d.text || 'Отчёт о доставке ещё не пришёл' };
+  return { text: 'отправлено', cls: '', title: 'Отчёт о доставке не пришёл' };
+}
 const FWD = { done: 'переслано', error: 'ошибка пересылки', pending: 'пересылается…', skipped: 'не пересылается (свой номер)', limit: 'не переслано: лимит' };
 
 function renderDetail(allThreads) {
@@ -437,7 +446,7 @@ function bubble(it) {
       h('div', { class: 'text', text: it.text }),
       h('div', { class: 'meta' },
         String(it.via || '').startsWith('api:') ? h('span', { text: 'API' }) : null,
-        h('span', { text: STATUS[it.status] || it.status, title: it.result || '' }),
+        ((l) => h('span', { class: 'delivery ' + l.cls, text: l.text, title: l.title || it.result || '' }))(deliveryLabel(it.status, it.delivery)),
         h('span', { text: hhmm(it.time), title: fullTime(it.time) })),
       it.status === 'error' && it.result ? h('div', { class: 'meta', text: it.result }) : null);
   }
@@ -470,13 +479,16 @@ const OP_PILL = { done: ['ok', 'готово'], error: ['err', 'ошибка'], 
 
 function opRow(op) {
   const req = op.request || {};
-  const [cls, label] = OP_PILL[op.status] || ['', op.status];
+  const d = op.status === 'done' ? op.delivery : null;
+  const [cls, label] = d?.state === 'delivered' ? ['ok', 'доставлено'] : d?.state === 'failed' ? ['err', 'не доставлено']
+    : OP_PILL[op.status] || ['', op.status];
   const body = [];
   if (op.kind === 'send') body.push(req.text);
   if (op.kind === 'forward' || op.kind === 'forward-test') body.push((req.parts || []).join('\n'));
   if (op.kind === 'forward-batch') body.push((req.items || []).map((i) => i.parts.join('\n')).join('\n\n'));
   if (op.status === 'pending') body.push('Выполняется…');
   else if (op.result?.text) body.push((body.length ? '→ ' : '') + op.result.text);
+  if (d && d.state !== 'delivered') body.push('Доставка: ' + deliveryLabel(op.status, d).text + (d.text && d.state === 'failed' ? ` (${d.text})` : ''));
   const via = String(req.via || '');
   return h('div', { class: 'op' },
     h('span', { class: 'pill ' + cls, text: label }),

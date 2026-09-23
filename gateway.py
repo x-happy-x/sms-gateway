@@ -129,11 +129,22 @@ class Gateway:
                 data = {'sender': 'Неизвестный', 'text': 'Не удалось декодировать: ' + str(e), 'timestamp': '',
                         'concat': None, 'decode_error': True}
             self.store.add_sms(hashlib.sha256(raw.encode()).hexdigest(), raw, data)
+        self.redecode_failed()
         deleted = self.release_archived(r, items)
         m = re.search(r'\+CPMS:\s*"[^"]+",(\d+),(\d+)', r.at('AT+CPMS?'))
         self.state.update(last_sync=time.time(), error=None, auto_deleted=deleted,
                           used=int(m[1]) if m else len(items), capacity=int(m[2]) if m else None)
         return items
+
+    def redecode_failed(self):
+        """Re-reads archived PDUs that an older decoder could not parse."""
+        for sms_id, raw in self.store.failed_rows():
+            try:
+                data = decode(raw)
+            except Exception:
+                continue
+            self.store.update_data(sms_id, data)
+            logging.info('Re-decoded archived PDU %s', sms_id)
 
     def release_archived(self, r, items):
         deleted = 0
@@ -194,8 +205,8 @@ class Gateway:
     def send_sms(self, r, number, text, operation=None):
         validate_sms(number, text)
         self.ensure_quota(1)
-        r.call('/tool/sms/send', **{'port': 'lte1', 'phone-number': number, 'message': text, 'status-report-request': 'no'})
-        self.store.log_sent(1, operation)
+        r.call('/tool/sms/send', **{'port': 'lte1', 'phone-number': number, 'message': text, 'status-report-request': 'yes'})
+        self.store.log_sent(1, operation, number, report=True)
         return {'text': 'RouterOS подтвердил отправку SMS. Это не отчёт о доставке.'}
 
     def send_parts(self, r, number, parts, operation=None):

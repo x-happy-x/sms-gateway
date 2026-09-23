@@ -13,20 +13,43 @@ def gsm7(data,count,offset=0):
 
 def semi(data):return ''.join(f'{b&15:X}{b>>4:X}' for b in data)
 def decode(raw):
+ """SMS-DELIVER (received) or SMS-SUBMIT (the modem's copy of a sent SMS, marked submit=True)."""
  b=bytes.fromhex(raw);p=1+b[0]
  def take(n):
   nonlocal p
   if p+n>len(b):raise ValueError('Обрезанный PDU')
   v=b[p:p+n];p+=n;return v
- first=take(1)[0]
- if first&3!=0:raise ValueError('Не SMS-DELIVER')
+ first=take(1)[0];mti=first&3
+ if mti==3:raise ValueError('Неизвестный тип PDU')
+ mr=take(1)[0] if mti in (1,2) else None  # message reference
  size,toa=take(2);addr=take((size+1)//2)
- sender=gsm7(addr,size*4//7) if toa&0x70==0x50 else ('+' if toa&0x70==0x10 else '')+semi(addr)[:size]
- pid,dcs=take(2);stamp=take(7)
+ address=gsm7(addr,size*4//7) if toa&0x70==0x50 else ('+' if toa&0x70==0x10 else '')+semi(addr)[:size]
+ if mti==2:
+  scts,discharge,st=scts_time(take(7)),scts_time(take(7)),take(1)[0]
+  state='delivered' if st<0x20 else 'pending' if st<0x40 else 'failed'
+  return dict(status_report=True,sender=address,recipient=address,mr=mr,scts=scts,discharge=discharge,status=st,
+              state=state,text=STATUS.get(st) or STATUS[st&0x60],timestamp=discharge,concat=None)
+ pid,dcs=take(2)
+ if mti==1:
+  take({0:0,2:1,1:7,3:7}[(first>>3)&3])  # validity period: none, relative, enhanced, absolute
+  timestamp=''
+ else:
+  timestamp=scts_time(take(7))
+ udl=take(1)[0]
+ out=dict(sender=address,**user_data(first,dcs,udl,b[p:]),timestamp=timestamp,dcs=dcs)
+ if mti==1:out.update(submit=True,recipient=address)
+ return out
+
+STATUS={0:'доставлено',1:'передано, доставка не подтверждена',2:'заменено оператором',
+ 0x20:'оператор ещё пытается доставить',0x40:'не доставлено',0x60:'не доставлено, оператор прекратил попытки'}
+
+def scts_time(stamp):
  ds=[int(semi(bytes([x]))) for x in stamp[:6]]
  z=stamp[6];zone=((z&7)*10+(z>>4))*15*(-1 if z&8 else 1)
- timestamp=datetime.datetime(2000+ds[0],*ds[1:],tzinfo=datetime.timezone(datetime.timedelta(minutes=zone))).isoformat()
- udl=take(1)[0];data=b[p:];header=0;concat=None
+ return datetime.datetime(2000+ds[0],*ds[1:],tzinfo=datetime.timezone(datetime.timedelta(minutes=zone))).isoformat()
+
+def user_data(first,dcs,udl,data):
+ header=0;concat=None
  if first&64:
   if not data or data[0]+1>len(data):raise ValueError('Обрезанный UDH')
   header=data[0]+1;j=1
@@ -45,7 +68,7 @@ def decode(raw):
   if len(data)*8<udl*7:raise ValueError('Обрезанный GSM7')
   body=gsm7(data,udl-skip,skip*7)
  else:body='[Бинарное SMS] '+data[header:udl].hex().upper()
- return dict(sender=sender,text=body,timestamp=timestamp,concat=concat,dcs=dcs)
+ return dict(text=body,concat=concat)
 
 def encode(number,text):
  if not re.fullmatch(r'\+?\d{3,15}',number):raise ValueError('Номер: от 3 до 15 цифр, допустим + в начале')

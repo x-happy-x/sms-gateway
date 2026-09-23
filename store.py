@@ -7,6 +7,22 @@ from datetime import datetime
 
 # A concatenated SMS that is still missing parts is forwarded anyway after this delay.
 INCOMPLETE_GRACE = 600
+# A delivery report belongs to the SMS sent to the same number within this window around the
+# operator's receive time (SCTS); it tolerates clock drift between the router and the operator.
+REPORT_WINDOW = 900
+# Without a report after this long the delivery state is reported as unknown.
+REPORT_WAIT = 3 * 86400
+
+
+def _ts(iso):
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _key(number):
+    return ''.join(ch for ch in str(number or '') if ch.isdigit())[-10:]
 
 DEFAULT_FORWARD = {'enabled': False, 'number': '', 'max_parts': 3, 'since': None}
 DEFAULT_LIMITS = {'monthly': 0, 'reset_day': 1}
@@ -67,6 +83,10 @@ class Store:
                     count = 1 if op['kind'] == 'send' else len(json.loads(op['request'] or '{}').get('parts') or [])
                     if count:
                         c.execute('INSERT INTO sent_log(at,count,operation) VALUES(?,?,?)', (op['added'], count, op['id']))
+            log_columns = {row['name'] for row in c.execute('PRAGMA table_info(sent_log)')}
+            if 'number' not in log_columns:
+                c.execute('ALTER TABLE sent_log ADD COLUMN number TEXT')
+                c.execute('ALTER TABLE sent_log ADD COLUMN report INTEGER NOT NULL DEFAULT 0')
 
     # --- messages -----------------------------------------------------------
 
@@ -87,6 +107,9 @@ class Store:
         out, groups = [], {}
         for row in rows:
             d = json.loads(row['data'])
+            if d.get('submit') or d.get('status_report'):
+                # Modem copies of sent SMS and delivery reports are not incoming messages.
+                continue
             d.update(id=row['id'], ids=[row['id']], added=row['added'], unread=[row['id']] if row['read_at'] is None else [])
             con = d.get('concat')
             if not con:
@@ -121,6 +144,52 @@ class Store:
             d['forward'] = forwards.get(d['id'])
             d.pop('concat', None)
         return sorted(out, key=lambda m: (m['timestamp'] or '', m['added']), reverse=True)
+
+    def failed_rows(self):
+        with self.tx() as c:
+            return [(r['id'], r['raw']) for r in c.execute('SELECT id,raw,data FROM sms') if json.loads(r['data']).get('decode_error')]
+
+    def update_data(self, sms_id, data):
+        with self.tx() as c:
+            c.execute('UPDATE sms SET data=? WHERE id=?', (json.dumps(data, ensure_ascii=False), sms_id))
+
+    def deliveries(self, now=None):
+        """Delivery state per operation, matched from status reports by number and operator time."""
+        now = now or time.time()
+        with self.tx() as c:
+            units = [dict(r) for r in c.execute('SELECT id,at,operation,number FROM sent_log WHERE report=1 ORDER BY at')]
+            rows = [json.loads(r['data']) for r in c.execute('SELECT data FROM sms')]
+        # Several reports can describe one SMS (temporary error, then final); keep the latest.
+        reports = {}
+        for d in rows:
+            if not d.get('status_report') or _ts(d.get('scts')) is None:
+                continue
+            key = (_key(d['recipient']), d.get('mr'), d['scts'])
+            if key not in reports or (_ts(d.get('discharge')) or 0) >= (_ts(reports[key].get('discharge')) or 0):
+                reports[key] = d
+        matched = {}
+        for rep in sorted(reports.values(), key=lambda d: _ts(d['scts'])):
+            at = _ts(rep['scts'])
+            free = [u for u in units if u['id'] not in matched and _key(u['number']) == _key(rep['recipient'])
+                    and abs(u['at'] - at) <= REPORT_WINDOW]
+            if free:
+                matched[min(free, key=lambda u: abs(u['at'] - at))['id']] = rep
+        out = {}
+        for u in units:
+            rep = matched.get(u['id'])
+            state = rep['state'] if rep else ('pending' if now - u['at'] < REPORT_WAIT else 'unknown')
+            item = out.setdefault(u['operation'], {'total': 0, 'delivered': 0, 'failed': 0, 'pending': 0, 'unknown': 0,
+                                                   'at': None, 'text': None})
+            item['total'] += 1
+            item[state] += 1
+            if rep:
+                item['at'] = max(item['at'] or '', rep.get('discharge') or '') or None
+                if state == 'failed' or not item['text']:
+                    item['text'] = rep['text']
+        for item in out.values():
+            item['state'] = ('failed' if item['failed'] else 'delivered' if item['delivered'] == item['total']
+                             else 'pending' if item['pending'] else 'unknown')
+        return out
 
     def mark_read(self, ids, read=True):
         """Marks whole logical messages; any id of a message selects all its parts."""
@@ -179,7 +248,9 @@ class Store:
     def operation(self, oid):
         with self.tx() as c:
             row = c.execute('SELECT * FROM operations WHERE id=?', (oid,)).fetchone()
-        return self._operation(row) if row else None
+        if not row:
+            return None
+        return dict(self._operation(row), delivery=self.deliveries().get(oid))
 
     def operations(self, limit=30, kinds=None):
         query, args = 'SELECT * FROM operations', []
@@ -188,7 +259,8 @@ class Store:
             args += list(kinds)
         with self.tx() as c:
             rows = c.execute(query + ' ORDER BY added DESC LIMIT ?', (*args, limit)).fetchall()
-        return [self._operation(r) for r in rows]
+        deliveries = self.deliveries()
+        return [dict(self._operation(r), delivery=deliveries.get(r['id'])) for r in rows]
 
     def sent_since(self, since, kinds=('forward',)):
         with self.tx() as c:
@@ -257,9 +329,10 @@ class Store:
             c.execute("INSERT INTO settings(key,value) VALUES('limits',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                       (json.dumps(settings),))
 
-    def log_sent(self, count, operation=None):
+    def log_sent(self, count, operation=None, number=None, report=False):
         with self.tx() as c:
-            c.execute('INSERT INTO sent_log(at,count,operation) VALUES(?,?,?)', (time.time(), count, operation))
+            c.execute('INSERT INTO sent_log(at,count,operation,number,report) VALUES(?,?,?,?,?)',
+                      (time.time(), count, operation, number, int(report)))
 
     def sent_count(self, since):
         with self.tx() as c:
