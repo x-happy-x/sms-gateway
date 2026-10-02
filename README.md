@@ -38,6 +38,24 @@
 
 Прямой `AT+CMGS` через RouterOS at-chat не используется: при проверке он подвешивал модем.
 
+
+## Установка одной командой
+
+На Keenetic/Netcraze с Entware, в SSH роутера:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/x-happy-x/sms-gateway/master/install.sh | sh
+```
+
+Установщик ставит Python 3 из Entware, файлы шлюза в `/opt/sms-gateway` и
+init-скрипт, спрашивает адрес RouterOS (MikroTik с LTE-модемом), пользователя и
+пароль, адрес и порт веб-интерфейса, запускает шлюз и проверяет `/api/health`.
+Пароль вводится на роутере и попадает только в `config.json` (права 600).
+Повторный запуск обновляет шлюз: `config.json` и архив SMS остаются, прежние
+файлы копируются в `/opt/sms-gateway/backup-<время>`. Параметры: `--version=`
+(тег или ветка), `--dry-run`, `--uninstall`. Тот же шлюз ставится из общего
+установщика HomeNet (компонент «SMS-шлюз»).
+
 ## API
 
 Все запросы `/api/v1/*` требуют `Authorization: Bearer <token>`. В `config.json` хранится только SHA-256
